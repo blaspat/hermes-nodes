@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -484,6 +485,294 @@ func TestRun_ConnectsToServer(t *testing.T) {
 		if !strings.Contains(stdout.String(), "connecting") {
 			t.Errorf("stdout should contain 'connecting'; got %q", stdout.String())
 		}
+		if code != 0 {
+			t.Errorf("runRun returned %d; stderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runRun did not exit within 10s of ctx cancel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Single-instance daemon lock tests
+// ---------------------------------------------------------------------------
+
+// TestRunRun_RefusesWhenDaemonAlreadyRunning verifies that a second
+// daemon start refuses to run (and does not connect) when a live PID
+// already holds the single-instance lock file in the config dir.
+func TestRunRun_RefusesWhenDaemonAlreadyRunning(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	logPath := filepath.Join(dir, "audit.log")
+
+	cfg := &config.Config{
+		Node: config.NodeConfig{
+			ServerURL:    fs.URL(),
+			Name:         "test-node",
+			Token:        "test-token",
+			AllowedPaths: []string{dir},
+			LogPath:      logPath,
+		},
+	}
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a live daemon: write the lock file with our own PID —
+	// the liveness check (signal 0) will succeed because we exist.
+	lockPath := filepath.Join(dir, "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer runCancel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	code := runRun(runCtx, cfgPath, stdout, stderr)
+
+	if code != 1 {
+		t.Errorf("runRun with live lock should refuse with exit 1; got %d (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "already running") {
+		t.Errorf("stderr should mention 'already running'; got %q", stderr.String())
+	}
+	if fs.connected.Load() > 0 {
+		t.Errorf("second daemon must not connect; fake server saw %d connection(s)", fs.connected.Load())
+	}
+	// The existing lock file must be left untouched (owned by the live daemon).
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("lock file should still exist: %v", err)
+	}
+	if !strings.Contains(string(data), fmt.Sprintf("%d", os.Getpid())) {
+		t.Errorf("lock file should still name the original PID; got %q", string(data))
+	}
+}
+
+// TestRun_RefusesWhenDaemonAlreadyRunning exercises the same guard at
+// the CLI layer via the `run` subcommand, so the detach path also
+// refuses before forking a second daemon.
+func TestRun_RefusesWhenDaemonAlreadyRunning(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	logPath := filepath.Join(dir, "audit.log")
+
+	cfg := &config.Config{
+		Node: config.NodeConfig{
+			ServerURL:    fs.URL(),
+			Name:         "test-node",
+			Token:        "test-token",
+			AllowedPaths: []string{dir},
+			LogPath:      logPath,
+		},
+	}
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := filepath.Join(dir, "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	code := run([]string{"run", "--config", cfgPath}, stdout, stderr)
+
+	if code != 1 {
+		t.Errorf("`run` with live lock should refuse with exit 1; got %d (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "already running") {
+		t.Errorf("stderr should mention 'already running'; got %q", stderr.String())
+	}
+	if fs.connected.Load() > 0 {
+		t.Errorf("second daemon must not connect; fake server saw %d connection(s)", fs.connected.Load())
+	}
+}
+
+// TestRunRun_AcquiresLockWhenNoneHeld verifies a fresh start writes
+// the lock file with its own PID and that the file is removed on exit.
+func TestRunRun_AcquiresLockWhenNoneHeld(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test in -short mode")
+	}
+	fs := newFakeServer()
+	defer fs.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	logPath := filepath.Join(dir, "audit.log")
+
+	cfg := &config.Config{
+		Node: config.NodeConfig{
+			ServerURL:    fs.URL(),
+			Name:         "test-node",
+			Token:        "test-token",
+			AllowedPaths: []string{dir},
+			LogPath:      logPath,
+		},
+	}
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := filepath.Join(dir, "daemon.lock")
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock file should not exist before start; got err=%v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer runCancel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- runRun(runCtx, cfgPath, stdout, stderr)
+	}()
+
+	// Wait for the daemon to start and connect, then verify the lock
+	// file was created with the daemon PID.
+	connected := waitFor(3*time.Second, 20*time.Millisecond, func() bool {
+		return fs.connected.Load() > 0
+	})
+	if !connected {
+		runCancel()
+		<-done
+		t.Fatalf("fake server never saw a connection. stdout:\n%s\nstderr:\n%s",
+			stdout.String(), stderr.String())
+	}
+
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		runCancel()
+		<-done
+		t.Fatalf("lock file should exist while daemon is running: %v", err)
+	}
+	var lockPID int
+	if _, err := fmt.Sscanf(string(data), "%d", &lockPID); err != nil || lockPID <= 0 {
+		runCancel()
+		<-done
+		t.Fatalf("lock file should contain a valid PID; got %q", string(data))
+	}
+	// PID in the lock must be a live process (it should be the daemon
+	// or, in tests, a process we can signal-check).
+	proc, err := os.FindProcess(lockPID)
+	if err != nil || proc.Signal(os.Signal(syscall.Signal(0))) != nil {
+		runCancel()
+		<-done
+		t.Fatalf("lock PID %d is not alive", lockPID)
+	}
+
+	runCancel()
+	fs.Close()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("runRun returned %d; stderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runRun did not exit within 10s of ctx cancel")
+	}
+
+	// Lock file must be cleaned up on exit.
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Errorf("lock file should be removed on daemon exit; stat err=%v", err)
+	}
+}
+
+// TestRunRun_ReclaimsStaleLock verifies that a lock file left behind
+// by a dead daemon (stale PID) does not block a fresh start — the new
+// daemon takes over and connects.
+func TestRunRun_ReclaimsStaleLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test in -short mode")
+	}
+	fs := newFakeServer()
+	defer fs.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	logPath := filepath.Join(dir, "audit.log")
+
+	cfg := &config.Config{
+		Node: config.NodeConfig{
+			ServerURL:    fs.URL(),
+			Name:         "test-node",
+			Token:        "test-token",
+			AllowedPaths: []string{dir},
+			LogPath:      logPath,
+		},
+	}
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a lock file naming a PID that is almost certainly dead.
+	lockPath := filepath.Join(dir, "daemon.lock")
+	const deadPID = 99999
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", deadPID)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer runCancel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- runRun(runCtx, cfgPath, stdout, stderr)
+	}()
+
+	connected := waitFor(3*time.Second, 20*time.Millisecond, func() bool {
+		return fs.connected.Load() > 0
+	})
+	if !connected {
+		runCancel()
+		<-done
+		t.Fatalf("stale lock should not block startup; fake server never saw a connection. stdout:\n%s\nstderr:\n%s",
+			stdout.String(), stderr.String())
+	}
+
+	// The stale lock must have been replaced by our PID.
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		runCancel()
+		<-done
+		t.Fatalf("lock file should exist after takeover: %v", err)
+	}
+	var lockPID int
+	if _, err := fmt.Sscanf(string(data), "%d", &lockPID); err != nil || lockPID == deadPID {
+		runCancel()
+		<-done
+		t.Fatalf("lock should be reclaimed with the live daemon PID; got %q", string(data))
+	}
+
+	runCancel()
+	fs.Close()
+	select {
+	case code := <-done:
 		if code != 0 {
 			t.Errorf("runRun returned %d; stderr:\n%s", code, stderr.String())
 		}
