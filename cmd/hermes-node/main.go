@@ -103,12 +103,19 @@ var osExecutable = os.Executable
 // osUserHomeDir is a variable so tests can override it.
 var osUserHomeDir = os.UserHomeDir
 
+// startDaemon is the restart command's start hook. It defaults to
+// runDetach but is a variable so tests can stub the fork: re-exec'ing
+// a Go test binary would run the test suite, not a daemon. This is
+// the same override seam osExecutable and osUserHomeDir provide.
+var startDaemon = runDetach
+
 const usage = `hermes-node — pair a laptop with a Hermes Agent brain
 
 Usage:
   hermes-node pair --server <wss-url> --token <token> [--config <path>]
   hermes-node run [--config <path>]
   hermes-node stop
+  hermes-node restart [--config <path>]
   hermes-node status
   hermes-node update [--version <tag>] [--no-service] [--yes]
   hermes-node uninstall [--purge] [--dry-run]
@@ -128,6 +135,12 @@ Flags:
 'stop':
   hermes-node stop sends SIGTERM to the running daemon. If the
   daemon doesn't exit within 5 seconds, it sends SIGKILL.
+
+'restart':
+  hermes-node restart stops the running daemon and starts a fresh
+  one. If no daemon is running it simply starts. A failed stop
+  aborts the restart, so it never starts while another daemon
+  might still hold the lock.
 
 'update':
   hermes-node update downloads the latest release binary from
@@ -205,7 +218,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// version/help work even when $HOME is unset, and pair does
 	// too because pair is also a write path that will surface a
 	// clearer error from config.Save.
-	if (subArgs[0] == "run" || subArgs[0] == "pair") && *configPath == "" && defaultCfgErr != nil {
+	if (subArgs[0] == "run" || subArgs[0] == "pair" || subArgs[0] == "restart") && *configPath == "" && defaultCfgErr != nil {
 		fmt.Fprintf(stderr, "hermes-node: %v (pass --config <path> to override)\n", defaultCfgErr)
 		return 1
 	}
@@ -223,6 +236,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStatus(subArgs[1:], stdout, stderr, *configPath)
 	case "stop":
 		return runStop(*configPath, stdout, stderr)
+	case "restart":
+		return runRestart(*configPath, subArgs[1:], stdout, stderr)
 	case "update":
 		return runUpdate(subArgs[1:], stdout, stderr)
 	default:
@@ -1466,6 +1481,31 @@ func runStop(configPath string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "hermes-node: daemon killed")
 	return 0
+}
+
+// runRestart stops the running daemon (if any) and starts a fresh one.
+// It is a convenience wrapper over `stop` + `run`: with no daemon
+// running it simply starts. Any failure in the stop phase aborts the
+// restart, so it never starts while another daemon might still hold
+// the lock (the single-instance guard would refuse anyway, but the
+// stop-first order keeps a restart from racing an unknown PID).
+//
+// The final start goes through startDaemon (normally runDetach) so
+// tests can stub the fork; restart is otherwise exercised end-to-end
+// against a real sacrificial PID.
+func runRestart(configPath string, args []string, stdout, stderr io.Writer) int {
+	cfgDir := getConfigDir(configPath)
+
+	if pid, _ := lockOwnerPID(cfgDir); pid > 0 {
+		fmt.Fprintf(stdout, "hermes-node: stopping daemon (PID %d)...\n", pid)
+		if code := runStop(configPath, stdout, stderr); code != 0 {
+			return code
+		}
+	} else {
+		fmt.Fprintln(stdout, "hermes-node: daemon not running, starting...")
+	}
+
+	return startDaemon(configPath, args, stderr)
 }
 
 // getConfigDir returns the config directory from a config file path.
