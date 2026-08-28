@@ -11,12 +11,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -778,6 +781,172 @@ func TestRunRun_ReclaimsStaleLock(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("runRun did not exit within 10s of ctx cancel")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Restart subcommand tests
+// ---------------------------------------------------------------------------
+
+// TestRestartHelperProcess is not a real test: the restart tests spawn
+// it as a sacrificial "live daemon" so runStop can SIGTERM a real PID
+// without killing the test runner. It prints a readiness line and then
+// blocks until terminated.
+func TestRestartHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Println("restart-helper-pid-ready")
+	select {}
+}
+
+// TestRun_Restart_StopsRunningDaemonThenStarts verifies that restart
+// first stops a live daemon (SIGTERM to the real PID) and only then
+// issues a fresh start. The detach fork is stubbed so the test binary
+// isn't re-exec'd (Go test binaries can't act as the daemon child).
+func TestRun_Restart_StopsRunningDaemonThenStarts(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	// Spawn the sacrificial daemon process.
+	cmd := exec.Command(os.Args[0], "-test.run=TestRestartHelperProcess")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	pr, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	// Wait for the readiness line so the PID is guaranteed alive before
+	// we write the lock/status files naming it.
+	line, err := bufio.NewReader(pr).ReadString('\n')
+	if err != nil || !strings.Contains(line, "restart-helper-pid-ready") {
+		t.Fatalf("helper never became ready: %v (line %q)", err, line)
+	}
+	pid := cmd.Process.Pid
+
+	// Simulate the helper as the running daemon: lock + status name it.
+	lockPath := filepath.Join(dir, "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStatus(statusFilePath(dir), &nodeStatus{PID: pid, State: "connected"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stub the actual start so restart doesn't re-exec the test binary.
+	origStart := startDaemon
+	started := false
+	var startCfg string
+	startDaemon = func(cfg string, args []string, stderr io.Writer) int {
+		started = true
+		startCfg = cfg
+		return 0
+	}
+	defer func() { startDaemon = origStart }()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	code := run([]string{"restart", "--config", cfgPath}, stdout, stderr)
+
+	if code != 0 {
+		t.Errorf("restart exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !started {
+		t.Errorf("restart should start a fresh daemon after stopping; stdout: %s", stdout.String())
+	}
+	if startCfg != cfgPath {
+		t.Errorf("restart started daemon with config %q, want %q", startCfg, cfgPath)
+	}
+	if !strings.Contains(stdout.String(), "stopping daemon") {
+		t.Errorf("stdout should mention 'stopping daemon'; got %q", stdout.String())
+	}
+
+	// The old daemon must actually be gone (killed by SIGTERM). Reap it
+	// in a goroutine with a timeout so a failed stop can't hang the test.
+	waited := make(chan error, 1)
+	go func() {
+		_, err := cmd.Process.Wait()
+		waited <- err
+	}()
+	select {
+	case <-waited:
+		// Killed by SIGTERM — Wait returns a non-nil *ExitError.
+	case <-time.After(3 * time.Second):
+		t.Errorf("restart did not terminate the old daemon (PID %d)", pid)
+		_ = cmd.Process.Kill()
+		<-waited
+	}
+}
+
+// TestRun_Restart_NotRunningJustStarts verifies restart with no live
+// daemon skips the stop phase and goes straight to starting.
+func TestRun_Restart_NotRunningJustStarts(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	origStart := startDaemon
+	started := false
+	startDaemon = func(cfg string, args []string, stderr io.Writer) int {
+		started = true
+		return 0
+	}
+	defer func() { startDaemon = origStart }()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	code := run([]string{"restart", "--config", cfgPath}, stdout, stderr)
+
+	if code != 0 {
+		t.Errorf("restart exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !started {
+		t.Errorf("restart should start the daemon when none is running; stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "not running, starting") {
+		t.Errorf("stdout should mention 'not running, starting'; got %q", stdout.String())
+	}
+}
+
+// TestRun_Restart_AbortsIfStopFails verifies restart never starts when
+// the stop phase fails: a live lock with no status file makes runStop
+// fail, and starting anyway could race the still-unknown daemon for
+// the lock.
+func TestRun_Restart_AbortsIfStopFails(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+
+	// A live lock (our own PID) but no status file: the daemon holds
+	// the lock but never wrote status, so runStop can't find a PID to
+	// signal and reports an error. Restart must abort rather than start.
+	lockPath := filepath.Join(dir, "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origStart := startDaemon
+	started := false
+	startDaemon = func(cfg string, args []string, stderr io.Writer) int {
+		started = true
+		return 0
+	}
+	defer func() { startDaemon = origStart }()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	code := run([]string{"restart", "--config", cfgPath}, stdout, stderr)
+
+	if code != 1 {
+		t.Errorf("restart exit = %d, want 1 (stop failed)", code)
+	}
+	if started {
+		t.Errorf("restart must not start the daemon when the stop phase failed")
+	}
+	if !strings.Contains(stderr.String(), "status file not found") {
+		t.Errorf("stderr should surface the stop failure; got %q", stderr.String())
 	}
 }
 

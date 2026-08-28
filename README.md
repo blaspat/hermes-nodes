@@ -145,6 +145,14 @@ Stops the running daemon. Sends SIGTERM and waits up to 5 seconds for a clean sh
 hermes-node stop
 ```
 
+### `hermes-node restart`
+
+Stops the running daemon (if any) and starts a fresh one. If no daemon is running it simply starts. A failed stop aborts the restart, so it never starts while another daemon might still hold the lock.
+
+```bash
+hermes-node restart [--config <path>]
+```
+
 ### `hermes-node update`
 
 Self-updates the binary from GitHub Releases. Downloads the latest release for your OS/arch, verifies it, and replaces the running binary (Unix only — Windows prints manual instructions).
