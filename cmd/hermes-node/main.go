@@ -214,7 +214,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "pair":
 		return runPair(subArgs[1:], *configPath, stdout, stderr)
 	case "run":
-		return runDetach(*configPath, subArgs[1:])
+		return runDetach(*configPath, subArgs[1:], stderr)
 	case "uninstall":
 		return runUninstall(subArgs[1:], stdout, stderr)
 	case "validate":
@@ -238,11 +238,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 // in the foreground instead — the env var is set by the parent before
 // forking and acts as a sentinel so the child executes the real daemon
 // logic instead of forking again.
-func runDetach(configPath string, args []string) int {
+func runDetach(configPath string, args []string, stderr io.Writer) int {
 	// If we're the inner daemon (forked by the outer runDetach),
 	// skip the fork and run the real daemon logic directly.
 	if os.Getenv("HERMES_NODE_INNER") != "" {
-		return runRunWithSignalCtx(configPath, os.Stdout, os.Stderr)
+		return runRunWithSignalCtx(configPath, os.Stdout, stderr)
+	}
+
+	// Single-instance guard (outer check): refuse before forking so
+	// the CLI reports the refusal on the terminal, not in daemon.log.
+	// The authoritative lock is taken by the daemon itself in runRun —
+	// this early check just avoids spawning a doomed child. A missing
+	// config means no lock file location yet; runRun will surface the
+	// config error anyway.
+	if configPath != "" {
+		if pid, _ := lockOwnerPID(getConfigDir(configPath)); pid > 0 {
+			fmt.Fprintf(stderr, "hermes-node: daemon already running (PID %d) — run 'hermes-node stop' first\n", pid)
+			return 1
+		}
 	}
 
 	binPath, err := osExecutable()
@@ -738,6 +751,17 @@ func runRun(ctx context.Context, configPath string, stdout, stderr io.Writer) in
 		return 1
 	}
 
+	// Single-instance guard (authoritative): refuse to start when
+	// another live daemon holds the lock. The lock file lives next
+	// to config.toml and is removed on a clean exit; a crashed
+	// daemon leaves a stale lock that the next start reclaims.
+	releaseLock, err := acquireDaemonLock(getConfigDir(configPath))
+	if err != nil {
+		fmt.Fprintf(stderr, "hermes-node: %v\n", err)
+		return 1
+	}
+	defer releaseLock()
+
 	logLevel, _ := logger.ParseLevel(cfg.Node.LogLevel)
 
 	// When running as the inner daemon (HERMES_NODE_INNER set), replace
@@ -1171,6 +1195,78 @@ func runUpdate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// ---- single-instance daemon lock (used by runRun daemon and runDetach) ----
+
+// daemonLockPath returns the lock file path for a config dir. The lock
+// lives next to config.toml, alongside the status file and daemon.log.
+func daemonLockPath(configDir string) string {
+	return filepath.Join(configDir, "daemon.lock")
+}
+
+// lockOwnerPID reads the lock file in configDir and returns the PID it
+// names, but ONLY if that process is still alive. A lock file whose
+// PID is dead (or unreadable) is stale — the previous daemon crashed
+// or was killed — and is removed so a fresh start can claim it. It
+// returns 0 when no live daemon holds the lock.
+func lockOwnerPID(configDir string) (int, error) {
+	lockPath := daemonLockPath(configDir)
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil || pid <= 0 {
+		// Unparseable content = stale/foreign file; reclaim it.
+		_ = os.Remove(lockPath)
+		return 0, nil
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// On Unix FindProcess rarely fails; treat as not running.
+		_ = os.Remove(lockPath)
+		return 0, nil
+	}
+	if proc.Signal(os.Signal(syscall.Signal(0))) != nil {
+		// Dead PID — stale lock; reclaim it.
+		_ = os.Remove(lockPath)
+		return 0, nil
+	}
+	return pid, nil
+}
+
+// acquireDaemonLock enforces the single-instance rule. It returns an
+// error if a live daemon already holds the lock. On success it creates
+// the lock file naming this process and returns a cleanup func that
+// removes it (callers defer the cleanup so a crashed daemon leaves a
+// stale lock that the next start reclaims via lockOwnerPID).
+func acquireDaemonLock(configDir string) (func(), error) {
+	lockPath := daemonLockPath(configDir)
+	if pid, err := lockOwnerPID(configDir); err != nil {
+		return nil, err
+	} else if pid > 0 {
+		return nil, fmt.Errorf("daemon already running (PID %d) — run 'hermes-node stop' first", pid)
+	}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		return nil, fmt.Errorf("write daemon lock: %w", err)
+	}
+	return func() {
+		// Only remove the lock if it still names us. A takeover by a
+		// newer daemon must not be clobbered by our cleanup.
+		if data, err := os.ReadFile(lockPath); err == nil {
+			var pid int
+			if _, err := fmt.Sscanf(string(data), "%d", &pid); err == nil && pid == os.Getpid() {
+				_ = os.Remove(lockPath)
+			}
+		}
+	}, nil
 }
 
 // ---- status file (used by runRun daemon and status subcommand) ----
